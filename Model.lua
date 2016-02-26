@@ -134,6 +134,10 @@ function Model:create(m)
     require 'cunn'
     if self.hasCudnn then
       cudnn.convert(net, cudnn)
+      local convs = net:findModules('cudnn.SpatialConvolution')
+      for i, v in ipairs(convs) do
+        v:setMode('CUDNN_CONVOLUTION_FWD_ALGO_GEMM', 'CUDNN_CONVOLUTION_BWD_DATA_ALGO_1', 'CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1')
+      end
     end
     net:cuda()
   end
