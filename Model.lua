@@ -22,11 +22,14 @@ function Model:_init(opt)
   self.width = opt.width
   self.height = opt.height
   self.nChannels = opt.nChannels
+  self.hiddenSize = opt.hiddenSize
   self.histLen = opt.histLen
   self.duel = opt.duel
   self.bootstraps = opt.bootstraps
   self.recurrent = opt.recurrent
   self.ale = opt.ale
+  self.async = opt.async
+  self.a3c = opt.async == 'A3C'
 end
 
 -- Processes a single frame for DQN input; must not return same memory to prevent side-effects
@@ -54,8 +57,6 @@ end
 
 -- Creates a dueling DQN based on a number of discrete actions
 function Model:create(m)
-  -- Size of fully connected layers
-  local hiddenSize = self.ale and 512 or 32
   -- Number of input frames for recurrent networks is always 1
   local histLen = self.recurrent and 1 or self.histLen
 
@@ -89,26 +90,26 @@ function Model:create(m)
     -- Value approximator V^(s)
     local valStream = nn.Sequential()
     if self.recurrent then
-      local lstm = nn.FastLSTM(convOutputSize, hiddenSize, self.histLen)
-      lstm.i2g:init({'bias', {{3*hiddenSize+1, 4*hiddenSize}}}, nninit.constant, 1)
+      local lstm = nn.FastLSTM(convOutputSize, self.hiddenSize, self.histLen)
+      lstm.i2g:init({'bias', {{3*self.hiddenSize+1, 4*self.hiddenSize}}}, nninit.constant, 1)
       valStream:add(lstm)
     else
-      valStream:add(nn.Linear(convOutputSize, hiddenSize))
+      valStream:add(nn.Linear(convOutputSize, self.hiddenSize))
       valStream:add(nn.ReLU(true))
     end
-    valStream:add(nn.Linear(hiddenSize, 1)) -- Predicts value for state
+    valStream:add(nn.Linear(self.hiddenSize, 1)) -- Predicts value for state
 
     -- Advantage approximator A^(s, a)
     local advStream = nn.Sequential()
     if self.recurrent then
-      local lstm = nn.FastLSTM(convOutputSize, hiddenSize, self.histLen)
-      lstm.i2g:init({'bias', {{3*hiddenSize+1, 4*hiddenSize}}}, nninit.constant, 1)
+      local lstm = nn.FastLSTM(convOutputSize, self.hiddenSize, self.histLen)
+      lstm.i2g:init({'bias', {{3*self.hiddenSize+1, 4*self.hiddenSize}}}, nninit.constant, 1)
       advStream:add(lstm)
     else
-      advStream:add(nn.Linear(convOutputSize, hiddenSize))
+      advStream:add(nn.Linear(convOutputSize, self.hiddenSize))
       advStream:add(nn.ReLU(true))
     end
-    advStream:add(nn.Linear(hiddenSize, m)) -- Predicts action-conditional advantage
+    advStream:add(nn.Linear(self.hiddenSize, m)) -- Predicts action-conditional advantage
 
     -- Streams container
     local streams = nn.ConcatTable()
@@ -123,14 +124,18 @@ function Model:create(m)
     head:add(DuelAggregator(m))
   else
     if self.recurrent then
-      local lstm = nn.FastLSTM(convOutputSize, hiddenSize, self.histLen)
-      lstm.i2g:init({'bias', {{3*hiddenSize+1, 4*hiddenSize}}}, nninit.constant, 1) -- Extra: high forget gate bias (Gers et al., 2000)
+      local lstm = nn.FastLSTM(convOutputSize, self.hiddenSize, self.histLen)
+      lstm.i2g:init({'bias', {{3*self.hiddenSize+1, 4*self.hiddenSize}}}, nninit.constant, 1) -- Extra: high forget gate bias (Gers et al., 2000)
       head:add(lstm)
+      if self.async then
+        lstm:remember('both')
+        head:add(nn.ReLU(true)) -- DRQN paper reports worse performance with ReLU after LSTM, but lets do it anyway...
+      end
     else
-      head:add(nn.Linear(convOutputSize, hiddenSize))
+      head:add(nn.Linear(convOutputSize, self.hiddenSize))
       head:add(nn.ReLU(true)) -- DRQN paper reports worse performance with ReLU after LSTM
     end
-    head:add(nn.Linear(hiddenSize, m)) -- Note: Tuned DDQN uses shared bias at last layer
+    head:add(nn.Linear(self.hiddenSize, m)) -- Note: Tuned DDQN uses shared bias at last layer
   end
 
   if self.bootstraps > 0 then
@@ -148,19 +153,39 @@ function Model:create(m)
     end
     net:add(nn.GradientRescale(1/self.bootstraps)) -- Normalise gradients by number of heads
     net:add(headConcat)
+  elseif self.a3c then
+    net:add(nn.Linear(convOutputSize, self.hiddenSize))
+    net:add(nn.ReLU(true))
+
+    local valueAndPolicy = nn.ConcatTable()
+
+    local valueFunction = nn.Sequential()
+    valueFunction:add(nn.Linear(self.hiddenSize, 1))
+
+    local policy = nn.Sequential()
+    policy:add(nn.Linear(self.hiddenSize, m))
+    policy:add(nn.SoftMax())
+
+    valueAndPolicy:add(valueFunction)
+    valueAndPolicy:add(policy)
+
+    net:add(valueAndPolicy)
   else
     -- Add head via ConcatTable (simplifies bootstrap code in agent)
     local headConcat = nn.ConcatTable()
     headConcat:add(head)
     net:add(headConcat)
   end
-  net:add(nn.JoinTable(1, 1))
-  net:add(nn.View(heads, m))
 
-  if self.recurrent then
-    local sequencer = nn.Sequencer(net)
-    sequencer:remember('both') -- Keep hidden state between forward calls; requires manual calls to forget
-    net = nn.Sequential():add(nn.SplitTable(1, 4)):add(sequencer):add(nn.SelectTable(-1))
+  if not self.a3c then
+    net:add(nn.JoinTable(1, 1))
+    net:add(nn.View(heads, m))
+
+    if not self.async and self.recurrent then
+      local sequencer = nn.Sequencer(net)
+      sequencer:remember('both') -- Keep hidden state between forward calls; requires manual calls to forget
+      net = nn.Sequential():add(nn.SplitTable(1, 4)):add(sequencer):add(nn.SelectTable(-1))
+    end
   end
 
   -- GPU conversion
@@ -173,6 +198,10 @@ function Model:create(m)
   self.net = net
 
   return net
+end
+
+function Model:setNetwork(net)
+  self.net = net
 end
 
 -- Return list of convolutional filters as list of images
