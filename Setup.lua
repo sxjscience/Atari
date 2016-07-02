@@ -1,11 +1,11 @@
------ General Setup -----
 require 'logroll'
-local cjson = require 'cjson'
-local classic = require 'classic'
 local _ = require 'moses'
+local classic = require 'classic'
+local cjson = require 'cjson'
 
 local Setup = classic.class('Setup')
 
+-- Performs global setup
 function Setup:_init(arg)
   -- Create log10 for Lua 5.2
   if not math.log10 then
@@ -14,49 +14,64 @@ function Setup:_init(arg)
     end
   end
 
-  local opt = self:options(arg)
+  -- Parse command-line options
+  self.opt = self:parseOptions(arg)
 
-  -- Set up logs
-  local flog = logroll.file_logger(paths.concat(opt.experiments, opt._id, 'log.txt'))
+  -- Create experiment directory
+  if not paths.dirp(self.opt.experiments) then
+    paths.mkdir(self.opt.experiments)
+  end
+  paths.mkdir(paths.concat(self.opt.experiments, self.opt._id))
+  -- Save options for reference
+  local file = torch.DiskFile(paths.concat(self.opt.experiments, self.opt._id, 'opts.json'), 'w')
+  file:writeString(cjson.encode(self.opt))
+  file:close()
+
+  -- Set up logging
+  local flog = logroll.file_logger(paths.concat(self.opt.experiments, self.opt._id, 'log.txt'))
   local plog = logroll.print_logger()
-  log = logroll.combine(flog, plog)
+  log = logroll.combine(flog, plog) -- Global logger
 
-  self:validateOptions(opt)
+  -- Validate command-line options (logging errors)
+  self:validateOptions()
+
+  -- Augment environments to meet spec
+  self:augmentEnv()
 
   -- Torch setup
   log.info('Setting up Torch7')
   -- Use enhanced garbage collector
   torch.setheaptracking(true)
   -- Set number of BLAS threads
-  torch.setnumthreads(opt.threads)
+  torch.setnumthreads(self.opt.threads)
   -- Set default Tensor type (float is more efficient than double)
-  torch.setdefaulttensortype(opt.tensorType)
+  torch.setdefaulttensortype(self.opt.tensorType)
   -- Set manual seed
-  torch.manualSeed(opt.seed)
+  torch.manualSeed(self.opt.seed)
 
   -- Tensor creation function for removing need to cast to CUDA if GPU is enabled
-  opt.Tensor = function(...)
+  -- TODO: Replace with local functions across codebase
+  self.opt.Tensor = function(...)
     return torch.Tensor(...)
   end
 
   -- GPU setup
-  if opt.gpu > 0 then
+  if self.opt.gpu > 0 then
     log.info('Setting up GPU')
-    cutorch.setDevice(opt.gpu)
+    cutorch.setDevice(self.opt.gpu)
     -- Set manual seeds using random numbers to reduce correlations
     cutorch.manualSeed(torch.random())
     -- Replace tensor creation function
-    opt.Tensor = function(...)
+    self.opt.Tensor = function(...)
       return torch.CudaTensor(...)
     end
   end
 
-  self.opt = opt
   classic.strict(self)
 end
 
-
-function Setup:options(arg)
+-- Parses command-line options
+function Setup:parseOptions(arg)
   -- Detect and use GPU 1 by default
   local cuda = pcall(require, 'cutorch')
 
@@ -66,15 +81,18 @@ function Setup:options(arg)
   cmd:option('-threads', 4, 'Number of BLAS or async threads')
   cmd:option('-tensorType', 'torch.FloatTensor', 'Default tensor type')
   cmd:option('-gpu', cuda and 1 or 0, 'GPU device ID (0 to disable)')
-  -- Game
-  cmd:option('-game', 'catch', 'Name of Atari ROM (stored in "roms" directory)') -- Uses "Catch" env by default
+  -- Environment options
+  cmd:option('-env', 'rlenvs.Catch', 'Environment class (Lua file to be loaded/rlenv)')
+  cmd:option('-zoom', 1, 'Display zoom (requires QT)')
+  cmd:option('-game', '', 'Name of Atari ROM (stored in "roms" directory)')
   -- Training vs. evaluate mode
   cmd:option('-mode', 'train', 'Train vs. test mode: train|eval')
-  -- Screen preprocessing options
-  cmd:option('-height', 84, 'Resized screen height')
-  cmd:option('-width', 84, 'Resize screen width')
-  cmd:option('-colorSpace', 'y', 'Colour space conversion (screen is RGB): rgb|y|lab|yuv|hsl|hsv|nrgb')
+  -- State preprocessing options (for visual states)
+  cmd:option('-height', 0, 'Resized screen height (0 to disable)')
+  cmd:option('-width', 0, 'Resize screen width (0 to disable)')
+  cmd:option('-colorSpace', '', 'Colour space conversion (screen is RGB): <none>|y|lab|yuv|hsl|hsv|nrgb')
   -- Model options
+  cmd:option('-modelBody', '', 'Path to Torch nn model to be used as DQN "body"')
   cmd:option('-hiddenSize', 512, 'Number of units in the hidden fully connected layer')
   cmd:option('-histLen', 4, 'Number of consecutive states processed/used for backpropagation-through-time') -- DQN standard is 4, DRQN is 10
   cmd:option('-duel', 'true', 'Use dueling network architecture (learns advantage function)')
@@ -82,10 +100,11 @@ function Setup:options(arg)
   --cmd:option('-bootstrapMask', 1, 'Independent probability of masking a transition for each bootstrap head ~ Ber(bootstrapMask) (1 to disable)')
   cmd:option('-recurrent', 'false', 'Use recurrent connections')
   -- Experience replay options
+  cmd:option('-discretiseMem', 'true', 'Discretise states to integers ∈ [0, 255] for storage')
   cmd:option('-memSize', 1e6, 'Experience replay memory size (number of tuples)')
   cmd:option('-memSampleFreq', 4, 'Interval of steps between sampling from memory to learn')
   cmd:option('-memNSamples', 1, 'Number of times to sample per learning step')
-  cmd:option('-memPriority', 'rank', 'Type of prioritised experience replay: none|rank|proportional')
+  cmd:option('-memPriority', '', 'Type of prioritised experience replay: <none>|rank|proportional') -- TODO: Implement proportional prioritised experience replay
   cmd:option('-alpha', 0.65, 'Prioritised experience replay exponent α') -- Best vals are rank = 0.7, proportional = 0.6
   cmd:option('-betaZero', 0.45, 'Initial value of importance-sampling exponent β') -- Best vals are rank = 0.5, proportional = 0.4
   -- Reinforcement learning parameters
@@ -110,106 +129,156 @@ function Setup:options(arg)
   -- Evaluation options
   cmd:option('-progFreq', 10000, 'Interval of steps between reporting progress')
   cmd:option('-reportWeights', 'false', 'Report weight and weight gradient statistics')
+  cmd:option('-noValidation', 'false', 'Disable asynchronous agent validation thread') -- TODO: Make behaviour consistent across Master/AsyncMaster
   cmd:option('-valFreq', 250000, 'Interval of steps between validating agent') -- valFreq steps is used as an epoch, hence #epochs = steps/valFreq
   cmd:option('-valSteps', 125000, 'Number of steps to use for validation')
   cmd:option('-valSize', 500, 'Number of transitions to use for calculating validation statistics')
+  -- Async options
+  cmd:option('-async', '', 'Async agent: <none>|Sarsa|OneStepQ|NStepQ|A3C') -- TODO: Change names
+  cmd:option('-rmsEpsilon', 0.1, 'Epsilon for sharedRmsProp')
   -- ALEWrap options
   cmd:option('-fullActions', 'false', 'Use full set of 18 actions')
   cmd:option('-actRep', 4, 'Times to repeat action') -- Independent of history length
   cmd:option('-randomStarts', 30, 'Max number of no-op actions played before presenting the start of each training episode')
   cmd:option('-poolFrmsType', 'max', 'Type of pooling over previous emulator frames: max|mean')
   cmd:option('-poolFrmsSize', 2, 'Number of emulator frames to pool over')
-  -- Async options
-  cmd:option('-async', 'false', 'async method') -- OneStepQ|NStepQ|Sarsa|A3C
-  cmd:option('-rmsEpsilon', 0.1, 'Epsilon for sharedRmsProp')
-  cmd:option('-novalidation', 'false', 'dont run validation thread in async') -- for debugging
+  cmd:option('-lifeLossTerminal', 'true', 'Use life loss as terminal signal (training only)')
+  cmd:option('-flickering', 0, 'Probability of screen flickering (Catch only)')
   -- Experiment options
   cmd:option('-experiments', 'experiments', 'Base directory to store experiments')
   cmd:option('-_id', '', 'ID of experiment (used to store saved results, defaults to game name)')
   cmd:option('-network', '', 'Saved network weights file to load (weights.t7)')
   cmd:option('-verbose', 'false', 'Log info for every episode (only in train mode)')
-  cmd:option('-saliency', 'none', 'Display saliency maps (requires QT): none|normal|guided|deconvnet')
+  cmd:option('-saliency', '', 'Display saliency maps (requires QT): <none>|normal|guided|deconvnet')
   cmd:option('-record', 'false', 'Record screen (only in eval mode)')
   local opt = cmd:parse(arg)
 
   -- Process boolean options (Torch fails to accept false on the command line)
   opt.duel = opt.duel == 'true'
   opt.recurrent = opt.recurrent == 'true'
+  opt.discretiseMem = opt.discretiseMem == 'true'
   opt.doubleQ = opt.doubleQ == 'true'
   opt.reportWeights = opt.reportWeights == 'true'
   opt.fullActions = opt.fullActions == 'true'
+  opt.lifeLossTerminal = opt.lifeLossTerminal == 'true'
   opt.verbose = opt.verbose == 'true'
   opt.record = opt.record == 'true'
-  opt.novalidation = opt.novalidation == 'true'
-  if opt.async == 'false' then opt.async = false end
-  if opt.async then opt.gpu = 0 end
+  opt.noValidation = opt.noValidation == 'true'
 
-  -- Set ID as game name if not set
+  -- Process boolean/enum options
+  if opt.colorSpace == '' then opt.colorSpace = false end
+  if opt.memPriority == '' then opt.memPriority = false end
+  if opt.async == '' then opt.async = false end
+  if opt.saliency == '' then opt.saliency = false end
+  if opt.async then opt.gpu = 0 end -- Asynchronous agents are CPU-only
+
+  -- Set ID as env (plus game name) if not set
   if opt._id == '' then
-    opt._id = opt.game
+    local envName = paths.basename(opt.env)
+    if opt.game == '' then
+      opt._id = envName
+    else
+      opt._id = envName .. '.' .. opt.game
+    end
   end
-
-  opt.ale = opt.game ~= 'catch'
-
-  -- Create experiment directory
-  if not paths.dirp(opt.experiments) then
-    paths.mkdir(opt.experiments)
+  
+  -- Create one environment to extract specifications
+  local Env = require(opt.env)
+  local env = Env(opt)
+  opt.stateSpec = env:getStateSpec()
+  opt.actionSpec = env:getActionSpec()
+  -- Process display if available (can be used for saliency recordings even without QT)
+  if env.getDisplay then
+    opt.displaySpec = env:getDisplaySpec()
   end
-  paths.mkdir(paths.concat(opt.experiments, opt._id))
-  -- Save options for reference
-  local file = torch.DiskFile(paths.concat(opt.experiments, opt._id, 'opts.json'), 'w')
-  file:writeString(cjson.encode(opt))
-  file:close()
 
   return opt
 end
 
-
-local function abortIf(notOk, err)
-  if notOk then 
-    log.error(err)
-    error(err)
+-- Logs and aborts on error
+local function abortIf(err, msg)
+  if err then 
+    log.error(msg)
+    error(msg)
   end
 end
 
+-- Validates setup options
+function Setup:validateOptions()
+  -- Check environment state is a single tensor
+  abortIf(#self.opt.stateSpec ~= 3 or not _.isArray(self.opt.stateSpec[2]), 'Environment state is not a single tensor')
+  
+  -- Check environment has discrete actions
+  abortIf(self.opt.actionSpec[1] ~= 'int' or self.opt.actionSpec[2] ~= 1, 'Environment does not have discrete actions')
 
-function Setup:validateOptions(opt)
-  -- Calculate number of colour channels
-  abortIf(not _.contains({'rgb', 'y', 'lab', 'yuv', 'hsl', 'hsv', 'nrgb'}, opt.colorSpace),
-    'Unsupported colour space for conversion')
-  opt.nChannels = opt.colorSpace == 'y' and 1 or 3
+  -- Change state spec if resizing
+  if self.opt.height ~= 0 then 
+    self.opt.stateSpec[2][2] = self.opt.height
+  end
+  if self.opt.width ~= 0 then 
+    self.opt.stateSpec[2][3] = self.opt.width
+  end
+
+  -- Check colour conversions
+  if self.opt.colorSpace then
+    abortIf(not _.contains({'y', 'lab', 'yuv', 'hsl', 'hsv', 'nrgb'}, self.opt.colorSpace), 'Unsupported colour space for conversion')
+    abortIf(self.opt.stateSpec[2][1] ~= 3, 'Original colour space must be RGB for conversion')
+    -- Change state spec if converting from colour to greyscale
+    if self.opt.colorSpace == 'y' then
+      self.opt.stateSpec[2][1] = 1
+    end
+  end
 
   -- Check start of learning occurs after at least one minibatch of data has been collected
-  abortIf(opt.learnStart <= opt.batchSize, 'learnStart must be greater than batchSize')
+  abortIf(self.opt.learnStart <= self.opt.batchSize, 'learnStart must be greater than batchSize')
 
   -- Check enough validation transitions will be collected before first validation
-  abortIf(opt.valFreq <= opt.valSize, 'valFreq must be greater than valSize')
+  abortIf(self.opt.valFreq <= self.opt.valSize, 'valFreq must be greater than valSize')
 
   -- Check prioritised experience replay options
-  abortIf(not _.contains({'none', 'rank', 'proportional'}, opt.memPriority),
-    'Type of prioritised experience replay unrecognised')
+  abortIf(self.opt.memPriority and not _.contains({'rank', 'proportional'}, self.opt.memPriority), 'Type of prioritised experience replay unrecognised')
+  abortIf(self.opt.memPriority == 'proportional', 'Proportional prioritised experience replay not implemented yet') -- TODO: Implement
 
   -- Check start of learning occurs after at least 1/100 of memory has been filled
-  abortIf(opt.learnStart <= opt.memSize/100, 'learnStart must be greater than memSize/100')
+  abortIf(self.opt.learnStart <= self.opt.memSize/100, 'learnStart must be greater than memSize/100')
 
   -- Check memory size is multiple of 100 (makes prioritised sampling partitioning simpler)
-  abortIf(opt.memSize % 100 ~= 0, 'memSize must be a multiple of 100')
+  abortIf(self.opt.memSize % 100 ~= 0, 'memSize must be a multiple of 100')
 
   -- Check learning occurs after first progress report
-  abortIf(opt.learnStart < opt.progFreq, 'learnStart must be greater than progFreq')
+  abortIf(self.opt.learnStart < self.opt.progFreq, 'learnStart must be greater than progFreq')
 
   -- Check saliency map options
-  abortIf(not _.contains({'none', 'normal', 'guided', 'deconvnet'}, opt.saliency),
-    'Unrecognised method for visualising saliency maps')
+  abortIf(self.opt.saliency and not _.contains({'normal', 'guided', 'deconvnet'}, self.opt.saliency), 'Unrecognised method for visualising saliency maps')
+  
+  -- Check saliency is valid
+  abortIf(self.opt.saliency and not self.opt.displaySpec, 'Saliency cannot be shown without env:getDisplay()')
+  abortIf(self.opt.saliency and #self.opt.stateSpec[2] ~= 3 and (self.opt.stateSpec[2][1] ~= 3 or self.opt.stateSpec[2][1] ~= 1), 'Saliency cannot be shown without visual state')
 
-  if opt.async then
-    abortIf(opt.recurrent and opt.async ~= 'OneStepQ', 'recurrent only supported for OneStepQ in async for now')
-    abortIf(opt.PALpha > 0, 'PAL not supported in async modes yet')
-    abortIf(opt.bootstraps > 0, 'bootstraps not supported in async mode')
-    abortIf(opt.async == 'A3C' and opt.duel, 'dueling and A3C dont mix')
-    abortIf(opt.async == 'A3C' and opt.doubleQ, 'doubleQ and A3C dont mix')
+  -- Check async options
+  if self.opt.async then
+    abortIf(self.opt.recurrent and self.opt.async ~= 'OneStepQ', 'Recurrent connections only supported for OneStepQ in async for now')
+    abortIf(self.opt.PALpha > 0, 'Persistent advantage learning not supported in async modes yet')
+    abortIf(self.opt.bootstraps > 0, 'Bootstrap heads not supported in async mode yet')
+    abortIf(self.opt.async == 'A3C' and self.opt.duel, 'Dueling networks and A3C are incompatible')
+    abortIf(self.opt.async == 'A3C' and self.opt.doubleQ, 'Double Q-learning and A3C are incompatible')
+    abortIf(self.opt.saliency, 'Saliency maps not supported in async modes yet')
   end
 end
 
+-- Augments environments with extra methods if missing
+function Setup:augmentEnv()
+  local Env = require(self.opt.env)
+  local env = Env(self.opt)
+
+  -- Set up fake training mode (if needed)
+  if not env.training then
+    Env.training = function() end
+  end
+  -- Set up fake evaluation mode (if needed)
+  if not env.evaluate then
+    Env.evaluate = function() end
+  end
+end
 
 return Setup

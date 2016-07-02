@@ -1,4 +1,7 @@
-require 'socket'
+local classic = require 'classic'
+local threads = require 'threads'
+local tds = require 'tds'
+local signal = require 'posix.signal'
 local AsyncModel = require 'async/AsyncModel'
 local AsyncAgent = require 'async/AsyncAgent'
 local QAgent = require 'async/QAgent'
@@ -6,10 +9,7 @@ local OneStepQAgent = require 'async/OneStepQAgent'
 local NStepQAgent = require 'async/NStepQAgent'
 local A3CAgent = require 'async/A3CAgent'
 local ValidationAgent = require 'async/ValidationAgent'
-local classic = require 'classic'
-local threads = require 'threads'
-local signal = require 'posix.signal'
-local tds = require 'tds'
+require 'socket'
 threads.Threads.serialization('threads.sharedserialize')
 
 local FINISHED = -99999999
@@ -37,13 +37,11 @@ local function torchSetup(opt)
     require 'modules/GradientRescale'
     -- Use enhanced garbage collector
     torch.setheaptracking(true)
-    -- Set number of BLAS threads
-    -- must be 1 for each thread
+    -- Set number of BLAS threads to 1 (per thread)
     torch.setnumthreads(1)
     -- Set default Tensor type (float is more efficient than double)
     torch.setdefaulttensortype(tensorType)
-    -- Set manual seed: but different for each thread
-    -- to have different experiences, eg. catch randomness
+    -- Set manual seed (different for each thread to have different experiences)
     torch.manualSeed(seed * __threadid)
   end
 end  
@@ -55,7 +53,7 @@ local function threadedFormatter(thread)
     local msg = nil
 
     if #{...} > 1 then
-        msg = string.format(({...})[1], unpack(fn.rest({...})))
+        msg = string.format(({...})[1], table.unpack(fn.rest({...})))
     else
         msg = pprint.pretty_string(({...})[1])
     end
@@ -68,6 +66,14 @@ local function setupLogging(opt, thread)
   local _id = opt._id
   local threadName = thread
   return function()
+    unpack = table.unpack -- TODO: Remove global unpack from dependencies
+    -- Create log10 for Lua 5.2
+    if not math.log10 then
+      math.log10 = function(x)
+        return math.log(x, 10)
+      end
+    end
+
     require 'logroll'
     local thread = threadName or __threadid
     if type(thread) == 'number' then
@@ -118,7 +124,7 @@ function AsyncMaster:_init(opt)
     local signal = require 'posix.signal'
     local ValidationAgent = require 'async/ValidationAgent'
     validAgent = ValidationAgent(opt, theta, atomic)
-    if not opt.novalidation then
+    if not opt.noValidation then
       signal.signal(signal.SIGINT, function(signum)
         log.warn('SIGINT received')
         log.info('Saving agent')
@@ -200,7 +206,7 @@ function AsyncMaster:start()
     end
   end
 
-  if not self.opt.novalidation then
+  if not self.opt.noValidation then
     self.controlPool:addjob(validator)
   end
 

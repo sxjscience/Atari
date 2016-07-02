@@ -4,25 +4,17 @@ local Model = require 'Model'
 local AsyncModel = classic.class('AsyncModel')
 
 function AsyncModel:_init(opt)
-  log.info('Setting up ' .. (opt.ale and 'Arcade Learning Environment' or 'Catch'))
+  -- Initialise environment
+  log.info('Setting up ' .. opt.env)
+  local Env = require(opt.env)
+  self.env = Env(opt) -- Environment instantiation
 
-  if opt.ale then
-    local Atari = require 'rlenvs.Atari'
-    self.env = Atari(opt)
-    local stateSpec = self.env:getStateSpec()
-
-    -- Provide original channels, height and width for resizing from
-    opt.origChannels, opt.origHeight, opt.origWidth = table.unpack(stateSpec[2])
-  else
-    local Catch = require 'rlenvs.Catch'
-    self.env = Catch()
-    local stateSpec = self.env:getStateSpec()
-    
-    -- Provide original channels, height and width for resizing from
-    opt.origChannels, opt.origHeight, opt.origWidth = table.unpack(stateSpec[2])
-
-    -- Adjust height and width
-    opt.height, opt.width = stateSpec[2][2], stateSpec[2][3]
+  -- Augment environment with extra methods if missing
+  if not self.env.training then
+    self.env.training = function() end
+  end
+  if not self.env.evaluate then
+    self.env.evaluate = function() end
   end
 
   self.model = Model(opt)
@@ -36,10 +28,7 @@ function AsyncModel:getEnvAndModel()
 end
 
 function AsyncModel:createNet()
-  local actionSpec = self.env:getActionSpec()
-  local m = actionSpec[3][2] - actionSpec[3][1] + 1 -- Number of discrete actions
-  return self.model:create(m)
+  return self.model:create()
 end
-
 
 return AsyncModel
